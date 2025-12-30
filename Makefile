@@ -10,6 +10,11 @@ nobin     = $(shell echo "\e[31mNo BIN file specified\e[0m")
 
 ISA := riscv64
 
+# Simulator selection for CORVUSITOR flow:
+# - verilator (default): all partitions via Verilator
+# - gsim: COMB via GSIM, SEQ/EXTERNAL via Verilator (mixed wrapper)
+SIMULATOR ?= verilator
+
 ifeq ($(FLASH),1)
 param += FLASH
 CFLAGS += -DFLASH
@@ -64,6 +69,9 @@ CORVUS_REAL_PATH = $(CORVUS_PATH)
 else
 CORVUS_REAL_PATH = corvus-compiler
 endif
+
+# GSIM binary (built from ../simulator). Override if you installed gsim in PATH.
+GSIM_REAL_PATH ?= $(pwd)/../simulator/build/gsim
 
 ZMB ?= 0
 ifeq ($(ZMB),0)
@@ -136,7 +144,8 @@ clean-all: clean
 $(TOP_FILE_PATH):
 	mill -i sim.runMain sim.top.Elaborate args -td $(BUILD_DIR)/sim $(GENNAME) $(param)
 ifeq ($(CORVUS),1)
-	@$(CORVUS_REAL_PATH) $(BUILD_DIR)/sim/$(TOP).hw.mlir --split-verilog $(CORVUS_ARGS) -o $(BUILD_DIR)/sim
+	@$(CORVUS_REAL_PATH) $(BUILD_DIR)/sim/$(TOP).hw.mlir --split-verilog $(CORVUS_ARGS) -o $(BUILD_DIR)/sim \
+	  --output-hw-mlir $(BUILD_DIR)/sim/corvus_partitioned.hw.mlir
 endif
 
 verilate: $(TOP_FILE_PATH)
@@ -144,14 +153,22 @@ verilate: $(TOP_FILE_PATH)
 	verilator $(VFLAGS) --build $(CSRCS) -CFLAGS "$(CFLAGS)" -LDFLAGS "$(LDFLAGS)" >/dev/null
 
 ifeq ($(CORVUSITOR),1)
+ifeq ($(SIMULATOR),gsim)
+SIMULATE = corvusitor-mixed
+else
 SIMULATE = corvusitor
+endif
 else
 SIMULATE = verilate
 endif
 
 sim: $(LIB_SPIKE) $(SIMULATE)
 ifeq ($(CORVUSITOR),1)
+ifeq ($(SIMULATOR),gsim)
+	$(MAKE) -C $(BUILD_DIR)/sim/corvusitor-mixed-compile sim BIN=$(BIN)
+else
 	$(MAKE) -C $(BUILD_DIR)/sim/corvusitor-compile sim BIN=$(BIN)
+endif
 else
 ifeq ($(BIN),)
 	$(error $(nobin))
@@ -197,7 +214,37 @@ $(foreach f,$(CORVUS_MODULE_FILES),$(eval $(call RUN_CORVUS_MODULE,$f)))
 corvusitor: verilate-archive
 	mkdir -p $(BUILD_DIR)/sim/corvusitor-compile
 	cp $(simSrcDir)/sim_main_corvus.mk $(BUILD_DIR)/sim/corvusitor-compile/Makefile
-	$(CORVUSITOR_REAL_PATH) -m $(BUILD_DIR)/sim -o $(BUILD_DIR)/sim/corvusitor-compile/VCorvusTopWrapper_generated.cpp
+	$(CORVUSITOR_REAL_PATH) -m $(BUILD_DIR)/sim -o $(BUILD_DIR)/sim/corvusitor-compile/VCorvusTopWrapper_generated.cpp --backend-policy verilator
 	@$(MAKE) -C $(BUILD_DIR)/sim/corvusitor-compile _CORVUS_all
 
-.PHONY: test verilog help compile bsp reformat checkformat ysyxcheck clean clean-all verilate sim simall zmb lxb rv64 la32r $(LIB_DIR)/librv64spike.so corvusitor
+# Build GSIM COMB partitions from the partitioned HW MLIR produced by corvus-compiler.
+gsim-batch-comb: $(TOP_FILE_PATH)
+ifeq ($(CORVUS),1)
+	@echo "Running GSIM batch compile for COMB partitions..."
+	@$(GSIM_REAL_PATH) --batch-comb --dir $(BUILD_DIR)/sim $(BUILD_DIR)/sim/corvus_partitioned.hw.mlir
+else
+	@echo "CORVUS=1 is required for gsim-batch-comb (need partitioned HW MLIR)."
+	@exit 1
+endif
+
+# Mixed wrapper: COMB via GSIM, SEQ/EXTERNAL via Verilator.
+corvusitor-mixed: $(TOP_FILE_PATH)
+ifeq ($(CORVUS),1)
+	@# Build Verilator archive partitions only if missing (avoid rebuilding every run)
+	@if [ ! -f "$(BUILD_DIR)/sim/verilator-compile-corvus_external/Vcorvus_external__ALL.a" ]; then \
+	  $(MAKE) verilate-archive CORVUS=$(CORVUS) REPCUT_NUM=$(REPCUT_NUM); \
+	fi
+	@# Build GSIM COMB partitions only if missing
+	@if [ ! -f "$(BUILD_DIR)/sim/gsim-compile-corvus_comb_P0/module.json" ]; then \
+	  $(MAKE) gsim-batch-comb CORVUS=$(CORVUS) REPCUT_NUM=$(REPCUT_NUM); \
+	fi
+	mkdir -p $(BUILD_DIR)/sim/corvusitor-mixed-compile
+	cp $(simSrcDir)/sim_main_corvus.mk $(BUILD_DIR)/sim/corvusitor-mixed-compile/Makefile
+	$(CORVUSITOR_REAL_PATH) -m $(BUILD_DIR)/sim -o $(BUILD_DIR)/sim/corvusitor-mixed-compile/VCorvusTopWrapper_generated.cpp --backend-policy mixed
+	@$(MAKE) -C $(BUILD_DIR)/sim/corvusitor-mixed-compile _CORVUS_all
+else
+	@echo "CORVUS=1 is required for corvusitor-mixed (need partitioned COMB/SEQ modules)."
+	@exit 1
+endif
+
+.PHONY: test verilog help compile bsp reformat checkformat ysyxcheck clean clean-all verilate sim simall zmb lxb rv64 la32r $(LIB_DIR)/librv64spike.so corvusitor gsim-batch-comb corvusitor-mixed
